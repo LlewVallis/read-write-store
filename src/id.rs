@@ -1,6 +1,17 @@
-//! Unique IDs for elements in [RwStores](crate::RwStore).
+//! An opaque handle used to read, modify or remove an element from an [RwStore](crate::RwStore)
+//! once it has been inserted.
 //!
-//! See the [struct-level documentation](Id).
+//! When debug assertions are enabled, IDs will consume more memory to track the store that created
+//! them.
+//!
+//! # Example
+//!
+//! ```
+//! # use read_write_store::RwStore;
+//! let store = RwStore::new();
+//! let id_a = store.insert(42);
+//! let id_b = store.insert(42);
+//! ```
 
 use std::fmt;
 use std::fmt::{Debug, Formatter};
@@ -8,20 +19,8 @@ use std::ptr::NonNull;
 
 use crate::rwstore_id::RwStoreId;
 
-/// A handle used to read, modify or remove an element from an [RwStore](crate::RwStore)
-/// once it has been inserted.
-///
-/// When debug assertions are enabled, IDs will consume more memory to track the store which that
-/// created them.
-///
-/// # Example
-///
-/// ```
-/// # use read_write_store::RwStore;
-/// let store = RwStore::new();
-/// let id_a = store.insert(42);
-/// let id_b = store.insert(42);
-/// ```
+/// An opaque handle used to read, modify or remove an element from an [RwStore](crate::RwStore)
+/// once it has been inserted. See the [module-level documentation](crate::id) for more.
 #[derive(Copy, Clone)]
 pub struct Id {
     ordinal: u32,
