@@ -5,7 +5,9 @@ use std::time::Instant;
 use crate::timeout::{BlockResult, TimedOut};
 use crate::util::sync::atomic::{AtomicU64, Ordering};
 use crate::util::sync::park::{Park, ParkChoice, ParkResult};
-use crate::{Timeout, RESERVED_ID};
+use crate::Timeout;
+
+pub const RESERVED_ID: u32 = 0;
 
 /// An unsafe read-write lock with ID matching. As well as the lock state, a header stores an ID for
 /// the data it is guarding. Many operations on the header take an ID which is compared to the

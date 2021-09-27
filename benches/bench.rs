@@ -8,16 +8,14 @@ use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::{mem, thread};
 
 #[derive(Copy, Clone)]
 struct Element {
     _inner: [u64; 8],
 }
 
-const ELEMENT: Element = Element {
-    _inner: [42; 8]
-};
+const ELEMENT: Element = Element { _inner: [42; 8] };
 
 const MAX_THREAD_COUNT: usize = 8;
 const TRIALS: usize = 21;
@@ -27,6 +25,20 @@ const GRAPH_WIDTH: usize = 100;
 const LARGE_STORE_SIZE: usize = 1_000_000;
 
 fn main() {
+    println!(
+        "Element size: {}, align: {}",
+        mem::size_of::<Element>(),
+        mem::align_of::<Element>()
+    );
+
+    println!(
+        "Store size: {}, align: {}",
+        mem::size_of::<RwStore<Element>>(),
+        mem::align_of::<RwStore<Element>>()
+    );
+
+    println!();
+
     bench_mixed_workload("read heavy", LARGE_STORE_SIZE, 98.0, 0.0, 1.0, 1.0);
 
     bench_mixed_workload("write heavy", LARGE_STORE_SIZE, 0.0, 98.0, 1.0, 1.0);

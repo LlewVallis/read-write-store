@@ -125,29 +125,6 @@ fn stack_operations(operations: Vec<Operation>) -> Vec<Operation> {
 }
 
 #[test]
-fn insertion_reuses_slots_optimally() {
-    model(|| {
-        let store = LoomArc::new(RwStore::new());
-
-        let first_thread = spawn(store.clone(), |store| {
-            store.insert(42);
-        });
-
-        let second_thread = spawn(store.clone(), |store| {
-            let id = store.insert(42);
-            store.remove(id).unwrap();
-        });
-
-        first_thread.join().unwrap();
-        second_thread.join().unwrap();
-
-        store.insert(42);
-
-        assert_eq!(store.capacity().0, 2);
-    });
-}
-
-#[test]
 fn write_waits_for_read() {
     model(|| {
         let store = LoomArc::new(RwStore::new());

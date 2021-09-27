@@ -1,13 +1,14 @@
 //! Iterator implementations for [RwStore](crate::RwStore).
 
-use std::iter::FusedIterator;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
 
 use crate::block::Block;
+use crate::bucket::head_size_to_total_size;
 use crate::id::Id;
 use crate::util::debug_check::UnwrapDebugChecked;
-use crate::{head_size_to_total_size, RwStore};
+use crate::RwStore;
+use std::iter::FusedIterator;
 
 /// An owned iterator over an [RwStore](crate::RwStore).
 ///
@@ -28,13 +29,20 @@ pub struct IntoIter<Element> {
 impl<Element> IntoIter<Element> {
     /// Creates an owned iterator over an [RwStore](crate::RwStore).
     pub fn new(store: RwStore<Element>) -> Self {
-        let block_list = store.blocks.inner.into_inner();
+        let bucket_iters = IntoIterator::into_iter(store.buckets)
+            .enumerate()
+            .map(|(bucket_id, bucket)| {
+                let block_list = bucket.into_inner().inner.into_inner();
 
-        let last_slot = block_list.next_unused_slot.into_inner();
-        let current_block = block_list.head.map(OwnedBlockTracker::new);
+                let last_slot = block_list.next_unused_slot.into_inner();
+                let current_block = block_list.head.map(OwnedBlockTracker::new);
+
+                GenBucketIter::new(bucket_id as u32, last_slot, current_block)
+            })
+            .collect();
 
         Self {
-            iter: GenIter::new(last_slot, current_block),
+            iter: GenIter::new(bucket_iters),
         }
     }
 }
@@ -80,13 +88,22 @@ pub struct IterMut<'a, Element> {
 impl<'a, Element> IterMut<'a, Element> {
     /// Creates a mutable iterator over an [RwStore](crate::RwStore).
     pub fn new(store: &'a mut RwStore<Element>) -> Self {
-        let block_list = store.blocks.inner.get_mut();
+        let bucket_iters = store
+            .buckets
+            .iter_mut()
+            .enumerate()
+            .map(|(bucket_id, bucket)| {
+                let block_list = bucket.inner.get_mut();
 
-        let last_slot = block_list.next_unused_slot.load_directly();
-        let current_block = block_list.head.as_mut().map(MutBlockTracker::new);
+                let last_slot = block_list.next_unused_slot.load_directly();
+                let current_block = block_list.head.as_mut().map(MutBlockTracker::new);
+
+                GenBucketIter::new(bucket_id as u32, last_slot, current_block)
+            })
+            .collect();
 
         Self {
-            iter: GenIter::new(last_slot, current_block),
+            iter: GenIter::new(bucket_iters),
         }
     }
 }
@@ -113,24 +130,66 @@ impl<'a, Element: UnwindSafe> UnwindSafe for IterMut<'a, Element> {}
 
 impl<'a, Element: RefUnwindSafe> RefUnwindSafe for IterMut<'a, Element> {}
 
-struct GenIter<Tracker: GenBlockTracker> {
+struct GenIter<Tracker: BlockTracker> {
+    iters: Vec<GenBucketIter<Tracker>>,
+}
+
+impl<Tracker: BlockTracker> GenIter<Tracker> {
+    pub fn new(iters: Vec<GenBucketIter<Tracker>>) -> Self {
+        Self { iters }
+    }
+}
+
+impl<Tracker: BlockTracker> Iterator for GenIter<Tracker> {
+    type Item = Tracker::Element;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.iters.last_mut()?;
+
+        if let Some(result) = current.next() {
+            Some(result)
+        } else {
+            self.iters.pop();
+            self.next()
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (mut total_lower, mut total_upper) = (0, Some(0));
+
+        for iter in &self.iters {
+            let (lower, upper) = iter.size_hint();
+
+            total_lower += lower;
+            total_upper = total_upper.zip_with(upper, |a, b| a + b);
+        }
+
+        (total_lower, total_upper)
+    }
+}
+
+impl<Tracker: BlockTracker> FusedIterator for GenIter<Tracker> {}
+
+struct GenBucketIter<Tracker: BlockTracker> {
+    bucket_id: u32,
     last_slot: u32,
     current_block: Option<Tracker>,
 }
 
-impl<Tracker: GenBlockTracker> GenIter<Tracker> {
-    pub fn new(last_slot: u32, current_block: Option<Tracker>) -> Self {
+impl<Tracker: BlockTracker> GenBucketIter<Tracker> {
+    pub fn new(bucket_id: u32, last_slot: u32, current_block: Option<Tracker>) -> Self {
         let max_last_slot = current_block.as_ref().map(|block| block.len()).unwrap_or(0);
         let last_slot = last_slot.min(max_last_slot);
 
         Self {
+            bucket_id,
             last_slot,
             current_block,
         }
     }
 }
 
-impl<Tracker: GenBlockTracker> Iterator for GenIter<Tracker> {
+impl<Tracker: BlockTracker> Iterator for GenBucketIter<Tracker> {
     type Item = Tracker::Element;
 
     fn next(&mut self) -> Option<Tracker::Element> {
@@ -150,7 +209,7 @@ impl<Tracker: GenBlockTracker> Iterator for GenIter<Tracker> {
             let current_block = self.current_block.as_mut().unwrap_debug_checked();
             self.last_slot -= 1;
 
-            let contents = current_block.take(self.last_slot);
+            let contents = current_block.take(self.last_slot, self.bucket_id);
             match contents {
                 Some(result) => Some(result),
                 None => self.next(),
@@ -172,14 +231,14 @@ impl<Tracker: GenBlockTracker> Iterator for GenIter<Tracker> {
     }
 }
 
-impl<Tracker: GenBlockTracker> FusedIterator for GenIter<Tracker> {}
+impl<Tracker: BlockTracker> FusedIterator for GenBucketIter<Tracker> {}
 
-trait GenBlockTracker: Sized {
+trait BlockTracker: Sized {
     type Element;
 
     fn next(self) -> Option<Self>;
 
-    unsafe fn take(&mut self, slot: u32) -> Option<Self::Element>;
+    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<Self::Element>;
 
     fn len(&self) -> u32;
 }
@@ -194,15 +253,18 @@ impl<Element> OwnedBlockTracker<Element> {
     }
 }
 
-impl<Element> GenBlockTracker for OwnedBlockTracker<Element> {
+impl<Element> BlockTracker for OwnedBlockTracker<Element> {
     type Element = (Id, Element);
 
     fn next(self) -> Option<Self> {
         Block::into_next(self.block).map(OwnedBlockTracker::new)
     }
 
-    unsafe fn take(&mut self, slot: u32) -> Option<(Id, Element)> {
-        self.block.as_mut().get_unchecked_mut().take(slot)
+    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, Element)> {
+        self.block
+            .as_mut()
+            .get_unchecked_mut()
+            .take(slot, bucket_id)
     }
 
     fn len(&self) -> u32 {
@@ -220,7 +282,7 @@ impl<'a, Element> MutBlockTracker<'a, Element> {
     }
 }
 
-impl<'a, Element> GenBlockTracker for MutBlockTracker<'a, Element> {
+impl<'a, Element> BlockTracker for MutBlockTracker<'a, Element> {
     type Element = (Id, &'a mut Element);
 
     fn next(self) -> Option<Self> {
@@ -233,8 +295,11 @@ impl<'a, Element> GenBlockTracker for MutBlockTracker<'a, Element> {
         }
     }
 
-    unsafe fn take(&mut self, slot: u32) -> Option<(Id, &'a mut Element)> {
-        self.block.as_mut().get_unchecked_mut().slot_contents(slot)
+    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, &'a mut Element)> {
+        self.block
+            .as_mut()
+            .get_unchecked_mut()
+            .slot_contents(slot, bucket_id)
     }
 
     fn len(&self) -> u32 {

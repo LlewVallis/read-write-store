@@ -5,27 +5,34 @@
 
 #![feature(option_result_unwrap_unchecked)]
 #![feature(ptr_metadata)]
+#![feature(maybe_uninit_array_assume_init)]
+#![feature(maybe_uninit_uninit_array)]
+#![feature(option_zip)]
 #![warn(missing_docs)]
 
-use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::pin::Pin;
 use std::ptr::NonNull;
+
+use bucket::Bucket;
 
 use crate::block::Block;
 pub use crate::id::*;
 use crate::iter::{IntoIter, IterMut};
 use crate::lock::{ReadLock, WriteLock};
 use crate::rwstore_id::RwStoreId;
-use crate::timeout::{BlockResult, Timeout};
 pub use crate::timeout::*;
-use crate::util::sync::atomic::{AtomicU32, Ordering};
+use crate::timeout::{BlockResult, Timeout};
 use crate::util::sync::concurrent_queue::ConcurrentQueue;
-use crate::util::sync::rwlock::RwLock;
+use crossbeam_utils::CachePadded;
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use util::sync::thread;
 
 mod block;
+mod bucket;
 mod header;
 pub mod id;
+mod id_generator;
 pub mod iter;
 pub mod lock;
 #[cfg(all(test, loom))]
@@ -34,9 +41,7 @@ mod rwstore_id;
 pub mod timeout;
 mod util;
 
-const INITIAL_BLOCK_SIZE: u32 = 16;
-const RESIZE_FACTOR: u32 = 2;
-const RESERVED_ID: u32 = 0;
+const BUCKET_COUNT: usize = 16;
 
 /// A concurrent, unordered collection where each element has an internally generated ID and a
 /// read-write lock.
@@ -87,10 +92,10 @@ const RESERVED_ID: u32 = 0;
 ///
 /// * An empty store does not require any allocation.
 /// * Once an element is inserted, a fixed size block of element slots will be allocated.
-/// * When the store has reached capacity, a block double the size of the last one will be allocated
-///   and used concurrently with all previously allocated blocks.
+/// * As more space is needed, more blocks will be allocated which tend to increase in size. All
+///   allocated blocks are used alongside all previously allocated blocks; elements are never moved.
 /// * All removed elements whose memory is ready for reuse are tracked, so removing an element may
-///   cause a small allocation.
+///   allocate.
 ///
 /// # Caveats
 ///
@@ -98,14 +103,16 @@ const RESERVED_ID: u32 = 0;
 ///   dropped. This allows the element ID's to contain a pointer to the element that is valid for
 ///   the lifetime of the store.
 /// * Every element has a 8 bytes of overhead.
+/// * The store itself has a non-trivial memory overhead.
 /// * No facilities are currently provided for parallel iteration. Although this could be done, it
 ///   would mean an element whose ID is not shared between threads would no longer be guaranteed to
 ///   be accessible only from its inserting thread.
-/// * For performance reasons, no facilities are provided for querying the size in elements of the
+/// * For performance reasons, no facilities are provided for querying the number of elements in the
 ///   store.
 /// * A maximum of 2<sup>32</sup> - 1 elements can ever be inserted into any given store, including
-///   elements that have been removed. Breaking this invariant will panic when debug assertions are
-///   enabled, but may cause undefined behavior when they are disabled (i.e. in release mode).
+///   elements that have been removed. When debug assertions are enabled, breaking this invariant
+///   will panic, but when debug assertions are not enabled (i.e. in release mode) inserting more
+///   than 2<sup>32</sup> - 1 elements *may cause undefined behavior*.
 ///
 /// # Safety
 ///
@@ -119,12 +126,15 @@ const RESERVED_ID: u32 = 0;
 /// store will panic when debug assertions are enabled but *may cause undefined behavior* when they
 /// are not.
 pub struct RwStore<Element> {
-    store_id: RwStoreId,
-    // Should only be increased, should not be read from
-    next_id: AtomicU32,
-    blocks: BlockList<Element>,
+    buckets: [CachePadded<Bucket<Element>>; BUCKET_COUNT],
     // Contains slots ready for insertion
-    erasures: ConcurrentQueue<NonNull<()>>,
+    erasures: ConcurrentQueue<Erasure>,
+    // A globally unique ID for the store to ensure IDs from other stores are not used with this
+    // one. When debug assertions are disabled this is elided
+    store_id: RwStoreId,
+    // Ensures that the maximum number of inserts is respected. When debug assertions are disabled
+    // this is elided
+    insert_enforcer: MaximumInsertEnforcer,
 }
 
 impl<Element> RwStore<Element> {
@@ -132,16 +142,26 @@ impl<Element> RwStore<Element> {
     pub fn new() -> Self {
         let store_id = RwStoreId::generate();
 
+        let buckets = unsafe {
+            let mut buckets = MaybeUninit::uninit_array();
+
+            for bucket in &mut buckets {
+                *bucket = MaybeUninit::new(CachePadded::new(Bucket::new(store_id)));
+            }
+
+            MaybeUninit::array_assume_init(buckets)
+        };
+
         Self {
             store_id,
-            next_id: AtomicU32::new(RESERVED_ID + 1),
-            blocks: BlockList::new(store_id),
+            buckets,
             erasures: ConcurrentQueue::new(),
+            insert_enforcer: MaximumInsertEnforcer::new(),
         }
     }
 
-    /// Inserts an element into the store, returning it's generated unique ID. The returned ID can be
-    /// used to subsequently read, modify or remove the element.
+    /// Inserts an element into the store, returning it's generated unique ID. The returned ID can
+    /// be used to subsequently read, modify or remove the element.
     ///
     /// # Example
     ///
@@ -157,23 +177,26 @@ impl<Element> RwStore<Element> {
     /// assertions are enabled, doing so will panic, but when they are disabled (i.e. in release
     /// mode), doing so *may cause undefined behavior*.
     pub fn insert(&self, element: Element) -> Id {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(id != RESERVED_ID, "element IDs have been exhausted");
+        self.insert_enforcer.assert_may_insert();
 
-        let slot_address = self.next_insert_location();
-        unsafe { Block::insert(id, slot_address, element, self.store_id) }
+        let (bucket_id, bucket, slot_address) = if let Some(erasure) = self.erasures.pop() {
+            let bucket_id = erasure.bucket_id;
+            let bucket = &self.buckets[bucket_id as usize];
+            (erasure.bucket_id, bucket, erasure.slot_address)
+        } else {
+            let bucket_id = self.arbitrary_bucket_id();
+            let bucket = &self.buckets[bucket_id as usize];
+            let slot_address = bucket.next_insert_location();
+            (bucket_id, bucket, slot_address)
+        };
+
+        let id = bucket.id_generator.next();
+
+        unsafe { Block::insert(id, bucket_id, slot_address, element, self.store_id) }
     }
 
-    fn next_insert_location(&self) -> NonNull<()> {
-        if let Some(location) = self.erasures.pop() {
-            return location;
-        }
-
-        self.blocks.next_insert_location()
-    }
-
-    /// Removes an element from the store using its ID if it has not already been removed. Returns the
-    /// element if it was present.
+    /// Removes an element from the store using its ID if it has not already been removed. Returns
+    /// the element if it was present.
     ///
     /// If a read or write lock is held on the element, this will block until it is released.
     ///
@@ -195,8 +218,8 @@ impl<Element> RwStore<Element> {
             .unwrap()
     }
 
-    /// Removes an element from the store using its ID if it has not already been removed. Returns the
-    /// element if it was present.
+    /// Removes an element from the store using its ID if it has not already been removed. Returns
+    /// the element if it was present.
     ///
     /// If a read or write lock is held on the element, this will block until it is released or the
     /// given timeout expires.
@@ -221,7 +244,7 @@ impl<Element> RwStore<Element> {
 
         unsafe {
             if let Some(value) = Block::<Element>::remove(id, timeout)? {
-                self.erasures.push(id.slot_address);
+                self.push_erasure(id);
                 Ok(Some(value))
             } else {
                 Ok(None)
@@ -245,15 +268,25 @@ impl<Element> RwStore<Element> {
     ///
     /// # Safety
     ///
-    /// The given lock must have been acquired from one of the locking methods on this store. Using a
-    /// lock from another store will panic when debug assertions are enabled, but *may cause undefined
-    /// behavior* when they are disabled (i.e. in release mode).
+    /// The given lock must have been acquired from one of the locking methods on this store. Using
+    /// a lock from another store will panic when debug assertions are enabled, but *may cause
+    /// undefined behavior* when they are disabled (i.e. in release mode).
     pub fn remove_locked(&self, lock: WriteLock<Element>) -> Element {
         let id = lock.forget();
 
         self.assert_native_id(id);
 
-        unsafe { Block::<Element>::remove_locked(id) }
+        let element = unsafe { Block::<Element>::remove_locked(id) };
+        self.push_erasure(id);
+
+        element
+    }
+
+    fn push_erasure(&self, id: Id) {
+        self.erasures.push(Erasure {
+            bucket_id: id.bucket_id(),
+            slot_address: id.slot(),
+        });
     }
 
     /// Acquires a read lock on an element given its ID, if it is still present in the store.
@@ -448,7 +481,9 @@ impl<Element> RwStore<Element> {
         IterMut::new(self)
     }
 
-    /// Determines the touched and allocated capacity for this store, and returns them in that order.
+    /// Determines the touched and allocated capacity for this store, and returns them in that
+    /// order. These should be regarded as hints, if the store is being accessed concurrently the
+    /// actual capacity values may be larger (but not smaller) than those returned by this method.
     ///
     /// The touched capacity is equal to the largest number of elements ever contained in this store
     /// at the same time. The allocated capacity is the total number of element slots allocated for
@@ -467,27 +502,39 @@ impl<Element> RwStore<Element> {
     /// assert!(allocated >= 1);
     /// ```
     pub fn capacity(&self) -> (u32, u32) {
-        let block_list = self.blocks.inner.read();
+        let (mut total_touched, mut total_allocated) = (0, 0);
 
-        let head_size = block_list
-            .head
-            .as_ref()
-            .map(|block| block.len())
-            .unwrap_or(0);
+        for bucket in &self.buckets {
+            let (touched, allocated) = bucket.capacity();
+            total_touched += touched;
+            total_allocated += allocated;
+        }
 
-        let used = block_list.next_unused_slot.load(Ordering::Acquire);
+        (total_touched, total_allocated)
+    }
 
-        mem::drop(block_list);
+    /// Generates a pseudo-random bucket ID for element insertion. This will return different
+    /// results on different threads and invocations.
+    fn arbitrary_bucket_id(&self) -> u32 {
+        // Here we use a linear congruential generator using thread local state
 
-        let allocated_capacity = head_size_to_total_size(head_size);
-        let touched_capacity = head_size_to_total_size(head_size) - (head_size - used);
+        thread_local! {
+            static STATE: UnsafeCell<u32> = UnsafeCell::new(thread::current_thread_hash() as u32);
+        }
 
-        (touched_capacity, allocated_capacity)
+        STATE.with(|state| unsafe {
+            const MULTIPLIER: u32 = 1103515245;
+            const CONSTANT: u32 = 12345;
+
+            let state = &mut *state.get();
+            *state = state.wrapping_mul(MULTIPLIER).wrapping_add(CONSTANT);
+            *state % BUCKET_COUNT as u32
+        })
     }
 
     fn assert_native_id(&self, id: Id) {
         debug_assert!(
-            self.store_id == id.store_id,
+            self.store_id == id.store_id(),
             "attempted to use an ID created with a different store"
         )
     }
@@ -520,95 +567,60 @@ impl<Element: UnwindSafe> UnwindSafe for RwStore<Element> {}
 
 impl<Element: RefUnwindSafe> RefUnwindSafe for RwStore<Element> {}
 
-struct BlockList<Element> {
-    inner: RwLock<BlockListInner<Element>>,
+#[cfg(debug_assertions)]
+struct MaximumInsertEnforcer {
+    inserts_remaining: crate::util::sync::atomic::AtomicU32,
 }
 
-impl<Element> BlockList<Element> {
-    pub fn new(store_id: RwStoreId) -> Self {
+#[cfg(debug_assertions)]
+impl MaximumInsertEnforcer {
+    pub fn new() -> Self {
         Self {
-            inner: RwLock::new(BlockListInner::new(store_id)),
+            inserts_remaining: crate::util::sync::atomic::AtomicU32::new(u32::MAX - 1),
         }
     }
 
-    pub fn next_insert_location(&self) -> NonNull<()> {
-        let inner_read = self.inner.read();
+    fn assert_may_insert(&self) {
+        use crate::util::sync::atomic::Ordering;
 
-        if let Some(location) = inner_read.next_insert_location() {
-            return location;
+        let count = self.inserts_remaining.load(Ordering::Acquire);
+
+        if count == 0 {
+            panic!("too many elements have been inserted into this store");
         }
 
-        mem::drop(inner_read);
-        self.next_insert_location_slow()
-    }
+        let result = self.inserts_remaining.compare_exchange_weak(
+            count,
+            count - 1,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
 
-    #[inline(never)]
-    fn next_insert_location_slow(&self) -> NonNull<()> {
-        let mut inner_write = self.inner.write();
-
-        if let Some(location) = inner_write.next_insert_location() {
-            return location;
+        if result.is_err() {
+            self.assert_may_insert();
         }
-
-        inner_write.expand();
-        inner_write.next_insert_location().unwrap()
     }
 }
 
-struct BlockListInner<Element> {
-    head: Option<Pin<Box<Block<Element>>>>,
-    // This can only increase while read locked, but may be reset when write locked
-    next_unused_slot: AtomicU32,
-    store_id: RwStoreId,
+#[cfg(not(debug_assertions))]
+struct MaximumInsertEnforcer {
+    _private: (),
 }
 
-impl<Element> BlockListInner<Element> {
-    pub fn new(store_id: RwStoreId) -> Self {
+#[cfg(not(debug_assertions))]
+impl MaximumInsertEnforcer {
+    pub fn new() -> Self {
         Self {
-            head: None,
-            next_unused_slot: AtomicU32::new(0),
-            store_id,
+            _private: (),
         }
     }
 
-    pub fn next_insert_location(&self) -> Option<NonNull<()>> {
-        if let Some(head) = &self.head {
-            let slot = self.next_unused_slot.fetch_add(1, Ordering::AcqRel);
-
-            if slot < head.len() {
-                unsafe { Some(head.slot_address(slot)) }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn expand(&mut self) {
-        let block_size = if let Some(head) = &self.head {
-            head.len() * RESIZE_FACTOR
-        } else {
-            INITIAL_BLOCK_SIZE
-        };
-
-        let old_head = self.head.take();
-        let new_head = Block::new(block_size, old_head, self.store_id);
-
-        self.head = Some(new_head);
-        self.next_unused_slot.store_directly(0);
-    }
+    fn assert_may_insert(&self) {}
 }
 
-fn head_size_to_total_size(head_size: u32) -> u32 {
-    let mut total = 0;
-    let mut considered_block_size = INITIAL_BLOCK_SIZE;
-    while considered_block_size <= head_size {
-        total += considered_block_size;
-        considered_block_size *= RESIZE_FACTOR;
-    }
-
-    total
+struct Erasure {
+    bucket_id: u32,
+    slot_address: NonNull<()>,
 }
 
 #[cfg(test)]
@@ -616,8 +628,8 @@ mod test {
     use std::ops::Deref;
     use std::panic::{RefUnwindSafe, UnwindSafe};
 
-    use crate::{BlockResult, Id, RwStore};
     use crate::Timeout::DontBlock;
+    use crate::{BlockResult, Id, RwStore};
 
     #[test]
     fn insert_creates_disparate_ids() {
@@ -625,12 +637,15 @@ mod test {
         let id_a = store.insert(42);
         let id_b = store.insert(42);
 
-        assert_ne!(id_a.number, id_b.number);
-        assert_ne!(id_a.slot_address, id_b.slot_address);
+        assert_ne!(
+            (id_a.ordinal(), id_a.bucket_id()),
+            (id_b.ordinal(), id_b.bucket_id())
+        );
+        assert_ne!(id_a.slot::<()>(), id_b.slot());
     }
 
     #[test]
-    fn insert_reuses_space_optimally() {
+    fn insert_reuses_space_after_removal() {
         let store = RwStore::new();
 
         let id_a = store.insert(42);
@@ -638,11 +653,23 @@ mod test {
 
         let id_b = store.insert(42);
 
-        assert_eq!(id_a.slot_address, id_b.slot_address);
+        assert_eq!(id_a.slot::<()>(), id_b.slot());
     }
 
     #[test]
-    fn insert_doesnt_reuse_id_numbers() {
+    fn insert_reuses_space_after_locked_removal() {
+        let store = RwStore::new();
+
+        let id_a = store.insert(42);
+        store.remove_locked(store.write(id_a).unwrap());
+
+        let id_b = store.insert(42);
+
+        assert_eq!(id_a.slot::<()>(), id_b.slot());
+    }
+
+    #[test]
+    fn insert_doesnt_reuse_id_ordinals() {
         let store = RwStore::new();
 
         let id_a = store.insert(42);
@@ -650,7 +677,7 @@ mod test {
 
         let id_b = store.insert(42);
 
-        assert_ne!(id_a.number, id_b.number);
+        assert_ne!(id_a.ordinal(), id_b.ordinal());
     }
 
     #[test]
@@ -860,6 +887,58 @@ mod test {
         unsafe {
             assert_eq!(store.get_mut_unchecked(id), &mut 42);
         }
+    }
+
+    #[test]
+    fn capacity_returns_zeroes_initially() {
+        let store = RwStore::<u32>::new();
+        assert_eq!(store.capacity(), (0, 0));
+    }
+
+    #[test]
+    fn capacity_increases_on_first_insertion() {
+        let store = RwStore::<u32>::new();
+        store.insert(42);
+        assert_eq!(store.capacity().0, 1);
+        assert!(store.capacity().1 >= 1);
+    }
+
+    #[test]
+    fn capacity_increases_on_second_insertion() {
+        let store = RwStore::<u32>::new();
+        store.insert(42);
+        store.insert(42);
+        assert_eq!(store.capacity().0, 2);
+        assert!(store.capacity().1 >= 2);
+    }
+
+    #[test]
+    fn capacity_doesnt_decrease_after_removal() {
+        let store = RwStore::<u32>::new();
+        let id = store.insert(42);
+        store.remove(id).unwrap();
+        assert_eq!(store.capacity().0, 1);
+        assert!(store.capacity().1 >= 1);
+    }
+
+    #[test]
+    fn capacity_doesnt_increase_on_insertion_after_removal() {
+        let store = RwStore::<u32>::new();
+        let id = store.insert(42);
+        store.remove(id).unwrap();
+        store.insert(42);
+        assert_eq!(store.capacity().0, 1);
+        assert!(store.capacity().1 >= 1);
+    }
+
+    #[test]
+    fn capacity_doesnt_increase_on_insertion_after_locked_removal() {
+        let store = RwStore::<u32>::new();
+        let id = store.insert(42);
+        store.remove_locked(store.write(id).unwrap());
+        store.insert(42);
+        assert_eq!(store.capacity().0, 1);
+        assert!(store.capacity().1 >= 1);
     }
 
     #[test]

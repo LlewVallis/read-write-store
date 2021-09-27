@@ -24,24 +24,46 @@ use crate::rwstore_id::RwStoreId;
 /// ```
 #[derive(Copy, Clone)]
 pub struct Id {
-    pub(crate) number: u32,
-    pub(crate) slot_address: NonNull<()>,
-    pub(crate) store_id: RwStoreId,
+    ordinal: u32,
+    bucket_id: u32,
+    slot_address: NonNull<()>,
+    store_id: RwStoreId,
 }
 
 impl Id {
-    pub(crate) fn new<T>(number: u32, slot: &T, store_id: RwStoreId) -> Self {
+    pub(crate) fn new<T>(ordinal: u32, bucket_id: u32, slot: &T, store_id: RwStoreId) -> Self {
         Self {
-            number,
+            ordinal,
+            bucket_id,
             slot_address: NonNull::from(slot).cast(),
             store_id,
         }
+    }
+
+    pub(crate) fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub(crate) fn bucket_id(&self) -> u32 {
+        self.bucket_id
+    }
+
+    pub(crate) fn slot<T>(&self) -> NonNull<T> {
+        self.slot_address.cast()
+    }
+
+    pub(crate) fn store_id(&self) -> RwStoreId {
+        self.store_id
     }
 }
 
 impl Debug for Id {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Id({})", self.number)
+        f.debug_tuple("Id")
+            .field(&self.ordinal)
+            .field(&self.bucket_id)
+            .field(&self.slot_address)
+            .finish()
     }
 }
 
@@ -54,13 +76,6 @@ mod test {
     use std::panic::{RefUnwindSafe, UnwindSafe};
 
     use crate::RwStore;
-
-    #[test]
-    fn debug_includes_id_number() {
-        let store = RwStore::new();
-        let id = store.insert(0);
-        assert!(format!("{:?}", id).contains(&id.number.to_string()))
-    }
 
     #[test]
     fn implements_sync() {

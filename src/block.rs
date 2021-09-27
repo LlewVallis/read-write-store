@@ -7,12 +7,13 @@ use std::pin::Pin;
 use std::ptr;
 use std::ptr::NonNull;
 
-use crate::{RESERVED_ID, Timeout};
-use crate::BlockResult;
 use crate::header::Header;
+use crate::header::RESERVED_ID;
 use crate::id::Id;
 use crate::rwstore_id::RwStoreId;
 use crate::util::debug_check::{DebugCheckedMaybeUninit, IndexDebugChecked, UnwrapDebugChecked};
+use crate::BlockResult;
+use crate::Timeout;
 
 type Next<Element> = Option<Pin<Box<Block<Element>>>>;
 
@@ -29,6 +30,7 @@ pub struct Block<Element> {
 impl<Element> Block<Element> {
     pub fn new(size: u32, next: Option<Pin<Box<Self>>>, store_id: RwStoreId) -> Pin<Box<Self>> {
         debug_assert!(size != 0, "size cannot be zero");
+        debug_assert!(size.is_power_of_two(), "size must be a power of two");
 
         let header_size = mem::size_of::<BlockHeader<Element>>();
         let header_align = mem::align_of::<BlockHeader<Element>>();
@@ -49,7 +51,8 @@ impl<Element> Block<Element> {
             header_ptr.write(BlockHeader::new(next, store_id));
 
             for i in 0..size {
-                let slot_ptr = bytes_ptr.add(slots_offset).add(slot_size * i as usize) as *mut Slot<Element>;
+                let slot_ptr =
+                    bytes_ptr.add(slots_offset).add(slot_size * i as usize) as *mut Slot<Element>;
                 slot_ptr.write(Slot::new());
             }
 
@@ -79,6 +82,7 @@ impl<Element> Block<Element> {
 
     pub unsafe fn insert(
         id: u32,
+        bucket_id: u32,
         slot_address: NonNull<()>,
         element: Element,
         store_id: RwStoreId,
@@ -91,13 +95,13 @@ impl<Element> Block<Element> {
 
         slot.header.insert(id);
 
-        Id::new(id, slot, store_id)
+        Id::new(id, bucket_id, slot, store_id)
     }
 
     pub unsafe fn remove(id: Id, timeout: Timeout) -> BlockResult<Option<Element>> {
         let slot = Self::slot_from_id(id);
 
-        if slot.header.remove(id.number, timeout)? {
+        if slot.header.remove(id.ordinal(), timeout)? {
             let element = slot.value.get().read().assume_init();
             Ok(Some(element))
         } else {
@@ -109,28 +113,28 @@ impl<Element> Block<Element> {
         let slot = Self::slot_from_id(id);
 
         let element = slot.value.get().read().assume_init();
-        slot.header.remove_locked(id.number);
+        slot.header.remove_locked(id.ordinal());
         element
     }
 
     pub unsafe fn lock_read(id: Id, timeout: Timeout) -> BlockResult<bool> {
         let slot = Self::slot_from_id(id);
-        slot.header.lock_read(id.number, timeout)
+        slot.header.lock_read(id.ordinal(), timeout)
     }
 
     pub unsafe fn unlock_read(id: Id) {
         let slot = Self::slot_from_id(id);
-        slot.header.unlock_read(id.number)
+        slot.header.unlock_read(id.ordinal())
     }
 
     pub unsafe fn lock_write(id: Id, timeout: Timeout) -> BlockResult<bool> {
         let slot = Self::slot_from_id(id);
-        slot.header.lock_write(id.number, timeout)
+        slot.header.lock_write(id.ordinal(), timeout)
     }
 
     pub unsafe fn unlock_write(id: Id) {
         let slot = Self::slot_from_id(id);
-        slot.header.unlock_write(id.number)
+        slot.header.unlock_write(id.ordinal())
     }
 
     /// Gets a pointer to the contents of the slot referenced in the given ID. The ID's number must
@@ -147,7 +151,7 @@ impl<Element> Block<Element> {
     pub unsafe fn get_exclusive(id: Id) -> Option<NonNull<Element>> {
         let slot = Self::slot_from_id_mut(id);
 
-        if slot.header.id() == id.number {
+        if slot.header.id() == id.ordinal() {
             let contents = &*slot.value.get();
             Some(contents.contents_ptr())
         } else {
@@ -155,12 +159,12 @@ impl<Element> Block<Element> {
         }
     }
 
-    pub unsafe fn take(&mut self, slot: u32) -> Option<(Id, Element)> {
+    pub unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, Element)> {
         let slot = self.scramble_slot(slot);
         let slot = self.slots.get_debug_checked_mut(slot as usize);
 
         if let Some(id) = slot.header.reset() {
-            let id = Id::new(id, slot, self.header.store_id);
+            let id = Id::new(id, bucket_id, slot, self.header.store_id);
             let element = slot.value.get().read().assume_init();
             Some((id, element))
         } else {
@@ -168,14 +172,18 @@ impl<Element> Block<Element> {
         }
     }
 
-    pub unsafe fn slot_contents<'a>(&mut self, slot: u32) -> Option<(Id, &'a mut Element)> {
+    pub unsafe fn slot_contents<'a>(
+        &mut self,
+        slot: u32,
+        bucket_id: u32,
+    ) -> Option<(Id, &'a mut Element)> {
         let slot = self.scramble_slot(slot);
         let slot = self.slots.get_debug_checked_mut(slot as usize);
 
         let id = slot.header.id();
 
         if id != RESERVED_ID {
-            let id = Id::new(id, slot, self.header.store_id);
+            let id = Id::new(id, bucket_id, slot, self.header.store_id);
 
             let element_contents = (&*slot.value.get()).contents_ptr();
             let element = &mut *element_contents.as_ptr();
@@ -195,18 +203,28 @@ impl<Element> Block<Element> {
     }
 
     unsafe fn slot_from_id<'a>(id: Id) -> &'a Slot<Element> {
-        id.slot_address.cast().as_ref()
+        id.slot().as_ref()
     }
 
     unsafe fn slot_from_id_mut<'a>(id: Id) -> &'a mut Slot<Element> {
-        id.slot_address.cast().as_mut()
+        id.slot().as_mut()
     }
 
     /// Takes a logical slot and returns a physical slot which has been mapped pseudo-randomly to
-    /// help with false sharing. Internally uses modular multiplication with a prime number.
+    /// help with false sharing.
     fn scramble_slot(&self, slot: u32) -> u32 {
-        const LARGE_PRIME_NUMBER: u32 = 2147483659;
-        ((slot as u64 * LARGE_PRIME_NUMBER as u64) % self.len() as u64) as u32
+        // Multiplying by this factor and then taking it modulo the length is bijective if our
+        // factor is coprime with our length. Since all block lengths are powers of two, 3 will
+        // always be coprime with the length
+        const FACTOR: u32 = 3;
+
+        let unbounded = slot as u64 * FACTOR as u64;
+
+        // Since len is a power of two, we can create a mask that truncates to the length by
+        // removing one. This allows us to quickly perform a modulo
+        let bounded = unbounded as u32 & (self.len() - 1);
+
+        bounded
     }
 }
 
@@ -250,15 +268,15 @@ mod test {
     use std::pin::Pin;
     use std::rc::Rc;
 
-    use crate::block::Block;
+    use crate::block::{Block, Slot};
     use crate::id::Id;
     use crate::rwstore_id::RwStoreId;
     use crate::Timeout::DontBlock;
 
     #[test]
     fn len_returns_the_size() {
-        let block = Block::<()>::new(42, None, store_id());
-        assert_eq!(block.len(), 42);
+        let block = Block::<()>::new(32, None, store_id());
+        assert_eq!(block.len(), 32);
     }
 
     #[test]
@@ -267,8 +285,10 @@ mod test {
             let store_id = store_id();
             let block = Block::<u32>::new(1, None, store_id);
             let slot = block.slot_address(0);
-            let id = Block::insert(42, slot, 24, store_id);
-            assert_eq!(id.number, 42);
+            let id = Block::insert(42, 24, slot, 12, store_id);
+
+            assert_eq!(id.ordinal(), 42);
+            assert_eq!(id.bucket_id(), 24);
         }
     }
 
@@ -277,10 +297,10 @@ mod test {
         unsafe {
             let store_id = store_id();
             let block = Block::<u32>::new(1, None, store_id);
-            let id = Id {
-                number: 42,
-                slot_address: block.slot_address(0),
-                store_id,
+
+            let id = {
+                let slot = block.slot_address(0).cast::<Slot<u32>>().as_ref();
+                Id::new(42, 24, slot, store_id)
             };
 
             assert_eq!(Block::<u32>::remove(id, DontBlock), Ok(None));
@@ -298,8 +318,8 @@ mod test {
     #[test]
     fn removal_fails_when_id_doesnt_match() {
         unsafe {
-            let (_block, mut id) = singleton_block();
-            id.number += 1;
+            let (_block, id) = singleton_block();
+            let id = create_mismatching_id(id);
             assert_eq!(Block::<u32>::remove(id, DontBlock), Ok(None));
         }
     }
@@ -316,9 +336,16 @@ mod test {
     #[test]
     fn lock_read_fails_when_id_doesnt_match() {
         unsafe {
-            let (_block, mut id) = singleton_block();
-            id.number += 1;
+            let (_block, id) = singleton_block();
+            let id = create_mismatching_id(id);
             assert_eq!(Block::<u32>::lock_read(id, DontBlock), Ok(false));
+        }
+    }
+
+    fn create_mismatching_id(id: Id) -> Id {
+        unsafe {
+            let slot = id.slot::<Slot<u32>>().as_ref();
+            Id::new(id.ordinal() + 1, id.bucket_id(), slot, id.store_id())
         }
     }
 
@@ -346,7 +373,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(42, slot, element, store_id);
+            let id = Block::insert(42, 24, slot, element, store_id);
             Block::<Element>::remove(id, DontBlock).unwrap();
 
             assert_eq!(state.get(), 42);
@@ -377,7 +404,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(42, slot, element, store_id);
+            let id = Block::insert(42, 24, slot, element, store_id);
 
             Block::<Element>::lock_write(id, DontBlock).unwrap();
             Block::<Element>::remove_locked(id);
@@ -410,7 +437,7 @@ mod test {
                 state: state.clone(),
             };
 
-            Block::insert(42, slot, element, store_id);
+            Block::insert(42, 24, slot, element, store_id);
         }
 
         assert_eq!(state.get(), 42);
@@ -420,7 +447,7 @@ mod test {
         let store_id = store_id();
         let block = Block::new(1, None, store_id);
         let slot = block.slot_address(0);
-        let id = Block::insert(42, slot, 24, store_id);
+        let id = Block::insert(42, 12, slot, 24, store_id);
         (block, id)
     }
 
