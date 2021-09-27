@@ -1,5 +1,8 @@
 # Read Write Store
 
+![Crates.io](https://img.shields.io/crates/v/read-write-store)
+![docs.rs](https://img.shields.io/docsrs/read-write-store)
+
 A concurrent, unordered collection for Rust, where each element has an internally generated ID and a read-write lock.
 
 A store has O(1) time complexity for insertion, removal and lookups, although memory allocations triggered by insertion may cause a performance spike.
@@ -40,3 +43,7 @@ assert_eq!(store.remove(id), Some(24));
 // Now if we try to read using the ID, it will fail gracefully
 assert!(store.read(id).is_none());
 ```
+
+## Documentation
+
+The latest documentation can be [found here](https://docs.rs/read-write-store).

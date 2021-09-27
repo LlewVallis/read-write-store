@@ -6,7 +6,7 @@ edition = "2018"
 description = """
 A concurrent, unordered collection for Rust, where each element has an internally generated ID and a read-write lock.
 """
-documentation = "https://github.com/LlewVallis/read-write-store"
+documentation = "https://docs.rs/read-write-store"
 readme = "README.md"
 homepage = "https://github.com/LlewVallis/read-write-store"
 repository = "https://github.com/LlewVallis/read-write-store"
@@ -26,7 +26,7 @@ crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
 parking_lot = "0.2"
 
-[target.'cfg(loom)'.dependencies]
+[target.'cfg(loom)'.dev-dependencies]
 loom = "0.5"
 
 [dev-dependencies]
