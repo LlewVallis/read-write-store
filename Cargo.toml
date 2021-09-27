@@ -3,6 +3,17 @@ name = "read-write-store"
 version = "0.1.0"
 authors = ["LlewVallis <llewvallis@gmail.com>"]
 edition = "2018"
+description = """
+A concurrent, unordered collection for Rust, where each element has an internally generated ID and a read-write lock.
+"""
+documentation = "https://github.com/LlewVallis/read-write-store"
+readme = "README.md"
+homepage = "https://github.com/LlewVallis/read-write-store"
+repository = "https://github.com/LlewVallis/read-write-store"
+license = "MIT"
+keywords = ["atomic", "concurrent", "store"]
+categories = ["concurrency", "algorithms", "data-structures"]
+include = ["Cargo.toml", "src", "benches", "README.md", "LICENSE"]
 
 [profile.release]
 opt-level = 3

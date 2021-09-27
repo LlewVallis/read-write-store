@@ -1,5 +1,4 @@
 #![doc = include_str!("documentation.md")]
-
 #![feature(option_result_unwrap_unchecked)]
 #![feature(ptr_metadata)]
 #![feature(maybe_uninit_array_assume_init)]
@@ -526,9 +525,7 @@ struct MaximumInsertEnforcer {
 #[cfg(not(debug_assertions))]
 impl MaximumInsertEnforcer {
     pub fn new() -> Self {
-        Self {
-            _private: (),
-        }
+        Self { _private: () }
     }
 
     fn assert_may_insert(&self) {}
