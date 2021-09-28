@@ -1,7 +1,7 @@
 # Read Write Store
 
-![Crates.io](https://img.shields.io/crates/v/read-write-store)
-![docs.rs](https://img.shields.io/docsrs/read-write-store)
+[![Crates.io](https://img.shields.io/crates/v/read-write-store)](https://crates.io/crates/read-write-store)
+[![docs.rs](https://img.shields.io/docsrs/read-write-store)](https://docs.rs/read-write-store)
 
 A concurrent, unordered collection for Rust, where each element has an internally generated ID and a read-write lock.
 
