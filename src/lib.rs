@@ -48,23 +48,19 @@
 //! * An empty store does not require any allocation.
 //! * Once an element is inserted, a fixed size block of element slots will be allocated.
 //! * As more space is needed, more blocks will be allocated which tend to increase in size. All
-//! allocated blocks are used alongside all previously allocated blocks; elements are never moved.
+//!   allocated blocks are used alongside all previously allocated blocks; elements are never moved.
 //! * All removed elements whose memory is ready for reuse are tracked, so removing an element may
-//! allocate.
+//!   allocate.
 //!
 //! # Caveats
 //!
 //! * When a block of elements is allocated internally, it won't be deallocated until the store is
-//! dropped. This allows the element ID's to contain a pointer to the element that is valid for
-//! the lifetime of the store.
+//!   dropped. This allows the element ID's to contain a pointer to the element that is valid for
+//!   the lifetime of the store.
 //! * Every element has 8 bytes of overhead.
 //! * The store itself has a non-trivial memory overhead.
 //! * For performance reasons, no facilities are provided for querying the number of elements in the
-//! store.
-//! * A maximum of 2<sup>32</sup> - 1 elements can ever be inserted into any given store, including
-//! elements that have been removed. When debug assertions are enabled, breaking this invariant
-//! will panic, but when debug assertions are not enabled (i.e. in release mode) inserting more
-//! than 2<sup>32</sup> - 1 elements *may cause undefined behavior*.
+//!   store.
 //!
 //! # Safety
 //!
@@ -73,10 +69,6 @@
 //! a best effort attempt is made to panic when using an ID from a different store, but when they
 //! are disabled (i.e. in release mode), or if this best effort fails, this
 //! *may cause undefined behavior*.
-//!
-//! Similarly, inserting more than 2<sup>32</sup> - 1 elements, including removed elements, into a
-//! store will panic when debug assertions are enabled but *may cause undefined behavior* when they
-//! are not.
 
 #![feature(option_result_unwrap_unchecked)]
 #![feature(ptr_metadata)]
@@ -107,7 +99,6 @@ mod block;
 mod bucket;
 mod header;
 pub mod id;
-mod id_generator;
 pub mod iter;
 pub mod lock;
 #[cfg(all(test, loom))]
@@ -115,6 +106,8 @@ mod loom;
 mod rwstore_id;
 pub mod timeout;
 mod util;
+
+pub use header::MAX_CONCURRENT_READS;
 
 const BUCKET_COUNT: usize = 16;
 
@@ -127,9 +120,6 @@ pub struct RwStore<Element> {
     // A globally unique ID for the store to ensure IDs from other stores are not used with this
     // one. When debug assertions are disabled this is elided
     store_id: RwStoreId,
-    // Ensures that the maximum number of inserts is respected. When debug assertions are disabled
-    // this is elided
-    insert_enforcer: MaximumInsertEnforcer,
 }
 
 impl<Element> RwStore<Element> {
@@ -151,7 +141,6 @@ impl<Element> RwStore<Element> {
             store_id,
             buckets,
             erasures: ConcurrentQueue::new(),
-            insert_enforcer: MaximumInsertEnforcer::new(),
         }
     }
 
@@ -165,29 +154,17 @@ impl<Element> RwStore<Element> {
     /// let store = RwStore::new();
     /// let id = store.insert(42);
     /// ```
-    ///
-    /// # Safety
-    ///
-    /// This should not be called more than 2<sup>32</sup> - 1 times on any given store. When debug
-    /// assertions are enabled, doing so will panic, but when they are disabled (i.e. in release
-    /// mode), doing so *may cause undefined behavior*.
     pub fn insert(&self, element: Element) -> Id {
-        self.insert_enforcer.assert_may_insert();
-
-        let (bucket_id, bucket, slot_address) = if let Some(erasure) = self.erasures.pop() {
-            let bucket_id = erasure.bucket_id;
-            let bucket = &self.buckets[bucket_id as usize];
-            (erasure.bucket_id, bucket, erasure.slot_address)
+        let (bucket_id, slot_address) = if let Some(erasure) = self.erasures.pop() {
+            (erasure.bucket_id, erasure.slot_address)
         } else {
             let bucket_id = self.arbitrary_bucket_id();
             let bucket = &self.buckets[bucket_id as usize];
             let slot_address = bucket.next_insert_location();
-            (bucket_id, bucket, slot_address)
+            (bucket_id, slot_address)
         };
 
-        let id = bucket.id_generator.next();
-
-        unsafe { Block::insert(id, bucket_id, slot_address, element, self.store_id) }
+        unsafe { Block::insert(bucket_id, slot_address, element, self.store_id) }
     }
 
     /// Removes an element from the store using its ID if it has not already been removed. Returns
@@ -238,9 +215,12 @@ impl<Element> RwStore<Element> {
         self.assert_native_id(id);
 
         unsafe {
-            if let Some(value) = Block::<Element>::remove(id, timeout)? {
-                self.push_erasure(id);
-                Ok(Some(value))
+            if let Some(result) = Block::<Element>::remove(id, timeout)? {
+                if result.may_reuse {
+                    self.push_erasure(id);
+                }
+
+                Ok(Some(result.element))
             } else {
                 Ok(None)
             }
@@ -271,10 +251,13 @@ impl<Element> RwStore<Element> {
 
         self.assert_native_id(id);
 
-        let element = unsafe { Block::<Element>::remove_locked(id) };
-        self.push_erasure(id);
+        let result = unsafe { Block::<Element>::remove_locked(id) };
 
-        element
+        if result.may_reuse {
+            self.push_erasure(id);
+        }
+
+        result.element
     }
 
     fn push_erasure(&self, id: Id) {
@@ -287,6 +270,9 @@ impl<Element> RwStore<Element> {
     /// Acquires a read lock on an element given its ID, if it is still present in the store.
     ///
     /// If a write lock is held on the element, this will block until it is released.
+    ///
+    /// This may be called reentrantly, but acquiring more than 2<sup>31</sup> - 2 concurrent read
+    /// locks on the same element will panic.
     ///
     /// # Example
     ///
@@ -311,6 +297,9 @@ impl<Element> RwStore<Element> {
     ///
     /// If a write lock is held on the element, this will block until it is released or the given
     /// timeout expires.
+    ///
+    /// This may be called reentrantly, but acquiring more than 2<sup>31</sup> - 2 concurrent read
+    /// locks on the same element will panic.
     ///
     /// # Example
     ///
@@ -561,55 +550,6 @@ unsafe impl<Element: Send> Send for RwStore<Element> {}
 impl<Element: UnwindSafe> UnwindSafe for RwStore<Element> {}
 
 impl<Element: RefUnwindSafe> RefUnwindSafe for RwStore<Element> {}
-
-#[cfg(debug_assertions)]
-struct MaximumInsertEnforcer {
-    inserts_remaining: crate::util::sync::atomic::AtomicU32,
-}
-
-#[cfg(debug_assertions)]
-impl MaximumInsertEnforcer {
-    pub fn new() -> Self {
-        Self {
-            inserts_remaining: crate::util::sync::atomic::AtomicU32::new(u32::MAX - 1),
-        }
-    }
-
-    fn assert_may_insert(&self) {
-        use crate::util::sync::atomic::Ordering;
-
-        let count = self.inserts_remaining.load(Ordering::Acquire);
-
-        if count == 0 {
-            panic!("too many elements have been inserted into this store");
-        }
-
-        let result = self.inserts_remaining.compare_exchange_weak(
-            count,
-            count - 1,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-
-        if result.is_err() {
-            self.assert_may_insert();
-        }
-    }
-}
-
-#[cfg(not(debug_assertions))]
-struct MaximumInsertEnforcer {
-    _private: (),
-}
-
-#[cfg(not(debug_assertions))]
-impl MaximumInsertEnforcer {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-
-    fn assert_may_insert(&self) {}
-}
 
 struct Erasure {
     bucket_id: u32,

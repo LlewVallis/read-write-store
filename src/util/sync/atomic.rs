@@ -87,6 +87,11 @@ macro_rules! create_atomic {
             }
 
             #[allow(unused)]
+            pub fn fetch_or(&self, value: $type, ordering: Ordering) -> $type {
+                self.inner.fetch_or(value, ordering.native())
+            }
+
+            #[allow(unused)]
             pub fn into_inner(mut self) -> $type {
                 self.load_directly()
             }

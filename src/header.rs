@@ -7,28 +7,46 @@ use crate::util::sync::atomic::{AtomicU64, Ordering};
 use crate::util::sync::park::{Park, ParkChoice, ParkResult};
 use crate::Timeout;
 
-pub const RESERVED_ID: u32 = 0;
+pub const RESERVED_ID: u32 = u32::MAX;
+
+/// The maximum number of read locks which can be held concurrently.
+///
+/// Acquiring more than this number of read locks simultaneously will panic.
+pub const MAX_CONCURRENT_READS: u32 = (1 << 31) - 2;
 
 /// An unsafe read-write lock with ID matching. As well as the lock state, a header stores an ID for
 /// the data it is guarding. Many operations on the header take an ID which is compared to the
 /// stored ID to determine whether to proceed with the operation.
 pub struct Header {
-    // The lower 32 bits store the ID, the next highest 31 bits store either the number of readers,
-    // or all ones if there is a writer, the most significant bit is set when a thread needs to be
-    // notified. When there are no readers, the thread notification bit can not be set. There are
-    // never any readers when the header's ID is zeroed. The thread notification bit is always set
-    // before a thread starts to park and is always unset before all threads are unparked
+    // The layout of the header's state is as follows:
+    // * The most significant bit is the thread notification bit. This is set when no threads are
+    //   blocking on the header and is unset when there are threads blocking. The behavior of this
+    //   bit is the opposite what you might expect because the most significant 32 bits being set
+    //   represents a special state.
+    // * The next 31 most significant bits store the number of readers or is all ones if the header
+    //   is write locked. If the header is unlocked, these bits will be zero.
+    // * There are never any threads blocking on an unlocked header, so it is invalid for the thread
+    //   notification bit to be unset (indicating one or more waiting threads) and for the reader
+    //   bits to be all unset. This bit pattern instead represents the header being in an unoccupied
+    //   state.
+    // * The lower 32 bits store the ID if the header is occupied, or store the next ID if the
+    //   header is unoccupied.
     state: Park<AtomicU64>,
 }
 
 impl Header {
     pub fn new() -> Self {
+        let state = Self::unoccupied_bits(0);
+
+        debug_assert!(state == 0, "initial state was not zeroed");
+
         Self {
-            state: Park::new(AtomicU64::new(Self::unlocked_bits(RESERVED_ID))),
+            state: Park::new(AtomicU64::new(state)),
         }
     }
 
-    /// Locks the header for reading if it's ID matches and it is not write locked.
+    /// Locks the header for reading if it's ID matches and it is not write locked. If the IDs match
+    /// the header must be occupied.
     pub unsafe fn lock_read(&self, id: u32, timeout: Timeout) -> BlockResult<bool> {
         debug_assert!(id != RESERVED_ID, "attempted to read lock the reserved ID");
 
@@ -139,11 +157,13 @@ impl Header {
         }
     }
 
-    /// Write locks the header if its ID matches and it is not locked.
+    /// Write locks the header if its ID matches and it is not locked. If the IDs match the header
+    /// must be occupied.
     pub unsafe fn lock_write(&self, id: u32, timeout: Timeout) -> BlockResult<bool> {
-        debug_assert!(id != RESERVED_ID, "attempted to read lock the reserved ID");
+        debug_assert!(id != RESERVED_ID, "attempted to write lock the reserved ID");
+
         self.transition(
-            Self::unlocked_bits(id),
+            Self::occupied_unlocked_bits(id),
             Self::write_locked_bits(id),
             timeout,
         )
@@ -152,7 +172,7 @@ impl Header {
     /// Write unlocks the header. The header must be currently write locked and the ID must match
     /// this header's current ID.
     pub unsafe fn unlock_write(&self, id: u32) {
-        let new = Self::unlocked_bits(id);
+        let new = Self::occupied_unlocked_bits(id);
         let old = self.state.swap(new, Ordering::AcqRel);
 
         debug_assert!(
@@ -172,39 +192,55 @@ impl Header {
         }
     }
 
-    /// Sets the ID of the header and leaves it in an unlocked state. The header must be in the
-    /// zeroed state. It is not safe to race invocations to insert.
-    pub unsafe fn insert(&self, id: u32) {
-        debug_assert!(id != RESERVED_ID, "attempted to insert the reserved ID");
+    /// Moves the header from an unoccupied state into an occupied one, returning the ID of the
+    /// newly occupied header. The header must be in an unoccupied state.
+    pub unsafe fn occupy(&self) -> u32 {
+        let old = self
+            .state
+            .fetch_or(Self::thread_notification_mask(), Ordering::AcqRel);
 
-        let new = Self::unlocked_bits(id);
+        debug_assert!(
+            !Self::is_occupied(old),
+            "attempted to occupy occupied header"
+        );
 
-        if cfg!(debug_assertions) {
-            let old = self.state.swap(new, Ordering::AcqRel);
-            debug_assert!(
-                old == Self::unlocked_bits(RESERVED_ID),
-                "attempted to insert into header in use"
-            );
-        } else {
-            self.state.store(new, Ordering::Release);
-        }
+        debug_assert!(
+            Self::id_from_bits(old) != RESERVED_ID,
+            "attempted to occupy header with the reserved ID"
+        );
+
+        Self::id_from_bits(old)
     }
 
-    /// Zero's the ID of the header and leaves it ready for insertion if the ID matches and the
-    /// header is not locked.
-    pub unsafe fn remove(&self, id: u32, timeout: Timeout) -> BlockResult<bool> {
+    /// Increments the ID of the header and moves it into the unoccupied state if the ID matches. If
+    /// the IDs match, the header must be occupied.
+    pub unsafe fn remove(&self, id: u32, timeout: Timeout) -> BlockResult<RemoveResult> {
         debug_assert!(id != RESERVED_ID, "attempted to remove the reserved ID");
-        self.transition(
-            Self::unlocked_bits(id),
-            Self::unlocked_bits(RESERVED_ID),
+
+        let next_id = id + 1;
+
+        let matched = self.transition(
+            Self::occupied_unlocked_bits(id),
+            Self::unoccupied_bits(next_id),
             timeout,
-        )
+        )?;
+
+        if matched {
+            Ok(RemoveResult::Matched {
+                may_reuse: next_id != RESERVED_ID,
+            })
+        } else {
+            Ok(RemoveResult::DidntMatch)
+        }
     }
 
-    /// Zero's the ID of the header and leaves it ready for insertion. The header must be write
-    /// locked and the ID must match the header's current ID.
-    pub unsafe fn remove_locked(&self, id: u32) {
-        let new = Self::unlocked_bits(RESERVED_ID);
+    /// Write unlocks the header, increments the ID and moves it into the unoccupied state. The
+    /// header's ID must match and it must be in the write locked state. Returns whether the header
+    /// can be reused.
+    pub unsafe fn remove_locked(&self, id: u32) -> bool {
+        let next_id = id + 1;
+
+        let new = Self::unoccupied_bits(next_id);
         let old = self.state.swap(new, Ordering::AcqRel);
 
         debug_assert!(
@@ -222,10 +258,13 @@ impl Header {
         if Self::has_thread_blocking(old) {
             Park::unpark(&self.state)
         }
+
+        next_id != RESERVED_ID
     }
 
     /// Sets the state of the header to the new state if it is currently in the expected state. If
-    /// the expected value did not match, the thread will block until it does.
+    /// the expected value did not match, the thread will block until it does. If the ID of the
+    /// actual state is different to the ID of the expected state, this will fail.
     unsafe fn transition(&self, expected: u64, new: u64, timeout: Timeout) -> BlockResult<bool> {
         match self.compare_exchange_weak(expected, new) {
             Ok(_) => Ok(true),
@@ -308,8 +347,8 @@ impl Header {
     }
 
     /// Determines whether or not the header is tracking an element.
-    pub fn is_occupied(&mut self) -> bool {
-        self.state.load_directly() != 0
+    pub fn needs_drop(&mut self) -> bool {
+        Self::is_occupied(self.state.load_directly())
     }
 
     /// Determines the ID the header is currently tracking.
@@ -318,26 +357,39 @@ impl Header {
         Self::id_from_bits(state)
     }
 
-    /// Zeroes the header, returning the ID it was tracking if any. The header must not be locked.
-    pub fn reset(&mut self) -> Option<u32> {
-        debug_assert!(
-            Self::readers_from_bits(self.state.load_directly()) == 0,
-            "header had readers (0x{:x}) when being reset",
-            Self::readers_from_bits(self.state.load_directly()),
-        );
+    pub fn id_if_occupied(&mut self) -> Option<u32> {
+        let state = self.state.load_directly();
 
-        debug_assert!(
-            !Self::has_thread_blocking(self.state.load_directly()),
-            "header had thread blocking when being reset"
-        );
-
-        let id = Self::id_from_bits(self.state.load_directly());
-        self.state.store_directly(Self::unlocked_bits(RESERVED_ID));
-
-        if id == RESERVED_ID {
-            None
+        if Self::is_occupied(state) {
+            Some(Self::id_from_bits(state))
         } else {
+            None
+        }
+    }
+
+    /// Puts the header into the unoccupied state, returning the header's ID if it was occupied.
+    pub fn reset(&mut self) -> Option<u32> {
+        let state = self.state.load_directly();
+
+        debug_assert!(
+            Self::readers_from_bits(state) == 0,
+            "header had readers (0x{:x}) when being reset",
+            Self::readers_from_bits(state),
+        );
+
+        if Self::is_occupied(state) {
+            let id = Self::id_from_bits(state);
+
+            debug_assert!(
+                !Self::has_thread_blocking(state),
+                "header had thread blocking when being reset"
+            );
+
+            self.state.store_directly(Self::unoccupied_bits(id));
+
             Some(id)
+        } else {
+            None
         }
     }
 
@@ -351,12 +403,24 @@ impl Header {
             .compare_exchange_weak(expected, new, Ordering::AcqRel, Ordering::Acquire)
     }
 
-    fn unlocked_bits(id: u32) -> u64 {
+    fn unoccupied_bits(id: u32) -> u64 {
         id as u64
     }
 
+    fn occupied_unlocked_bits(id: u32) -> u64 {
+        Self::thread_notification_mask() | Self::unoccupied_bits(id)
+    }
+
+    fn thread_notification_mask() -> u64 {
+        1u64 << 63
+    }
+
+    fn is_occupied(state: u64) -> bool {
+        state >> 32 != 0
+    }
+
     fn write_locked_bits(id: u32) -> u64 {
-        id as u64 | ((u32::MAX as u64) << 32)
+        (id as u64) | ((u32::MAX as u64) << 32)
     }
 
     fn id_from_bits(bits: u64) -> u32 {
@@ -372,7 +436,12 @@ impl Header {
     }
 
     fn has_thread_blocking(bits: u64) -> bool {
-        bits & (1u64 << 63) != 0
+        debug_assert!(
+            Self::is_occupied(bits),
+            "cannot check thread blocking status when unoccupied"
+        );
+
+        bits & Self::thread_notification_mask() == 0
     }
 
     fn mark_thread_blocking(bits: u64) -> u64 {
@@ -383,17 +452,21 @@ impl Header {
 
         debug_assert!(
             Self::id_from_bits(bits) != RESERVED_ID,
-            "cannot block when empty"
+            "cannot block on the reserved ID"
         );
 
-        bits | (1u64 << 63)
+        bits & !Self::thread_notification_mask()
     }
 
     fn unmark_thread_blocking(bits: u64) -> u64 {
-        bits & !(1u64 << 63)
+        bits | Self::thread_notification_mask()
     }
 
     fn increment_readers(bits: u64) -> u64 {
+        if Self::readers_from_bits(bits) == MAX_CONCURRENT_READS {
+            Self::too_many_readers();
+        }
+
         debug_assert!(
             !Self::is_write_locked(bits),
             "cannot add reader when write locked"
@@ -405,6 +478,11 @@ impl Header {
         );
 
         bits + (1 << 32)
+    }
+
+    #[inline(never)]
+    fn too_many_readers() -> ! {
+        panic!("too many concurrent readers on RwStore element")
     }
 
     fn decrement_readers(bits: u64) -> u64 {
@@ -426,11 +504,17 @@ impl Drop for Header {
             );
 
             debug_assert!(
-                !Self::has_thread_blocking(state),
+                !Self::is_occupied(state) || !Self::has_thread_blocking(state),
                 "header had thread blocking when being dropped"
             );
         }
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum RemoveResult {
+    Matched { may_reuse: bool },
+    DidntMatch,
 }
 
 enum BlockChoice<T> {
@@ -440,7 +524,7 @@ enum BlockChoice<T> {
 
 #[cfg(test)]
 mod test {
-    use crate::header::Header;
+    use crate::header::{Header, RemoveResult};
     use crate::timeout::TimedOut;
     use crate::timeout::Timeout::DontBlock;
 
@@ -451,12 +535,21 @@ mod test {
     }
 
     #[test]
-    fn reset_returns_the_inserted_id() {
+    fn reset_returns_the_tracked_id() {
         unsafe {
             let mut header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.reset(), Some(42));
+            assert_eq!(header.reset(), Some(id));
+        }
+
+        unsafe {
+            let mut header = Header::new();
+            let id = header.occupy();
+            header.remove(id, DontBlock).unwrap();
+            let id = header.occupy();
+
+            assert_eq!(header.reset(), Some(id));
         }
     }
 
@@ -464,7 +557,7 @@ mod test {
     fn reset_returns_none_after_double_invocation() {
         unsafe {
             let mut header = Header::new();
-            header.insert(42);
+            header.occupy();
 
             header.reset();
             assert_eq!(header.reset(), None);
@@ -472,58 +565,42 @@ mod test {
     }
 
     #[test]
-    fn is_occupied_is_false_initially() {
+    fn needs_drop_is_false_initially() {
         let mut header = Header::new();
-        assert!(!header.is_occupied());
+        assert!(!header.needs_drop());
     }
 
     #[test]
-    fn is_occupied_is_true_after_insertion() {
+    fn needs_drop_is_true_after_occupation() {
         unsafe {
             let mut header = Header::new();
-            header.insert(42);
+            header.occupy();
 
-            assert!(header.is_occupied());
+            assert!(header.needs_drop());
         }
     }
 
     #[test]
-    fn is_occupied_is_false_after_removal() {
+    fn needs_drop_is_false_after_removal() {
         unsafe {
             let mut header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.remove(42, DontBlock).unwrap();
-            assert!(!header.is_occupied());
+            header.remove(id, DontBlock).unwrap();
+            assert!(!header.needs_drop());
         }
     }
 
     #[test]
-    fn is_occupied_is_false_after_locked_removal() {
+    fn needs_drop_is_false_after_locked_removal() {
         unsafe {
             let mut header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_write(42, DontBlock).unwrap();
-            header.remove_locked(42);
+            header.lock_write(id, DontBlock).unwrap();
+            header.remove_locked(id);
 
-            assert!(!header.is_occupied());
-        }
-    }
-
-    #[test]
-    fn lock_read_fails_before_insertion() {
-        unsafe {
-            let header = Header::new();
-            assert_eq!(header.lock_read(42, DontBlock), Ok(false));
-        }
-    }
-
-    #[test]
-    fn lock_write_fails_before_insertion() {
-        unsafe {
-            let header = Header::new();
-            assert_eq!(header.lock_write(42, DontBlock), Ok(false));
+            assert!(!header.needs_drop());
         }
     }
 
@@ -531,10 +608,10 @@ mod test {
     fn lock_read_succeeds_when_id_matches() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.lock_read(42, DontBlock), Ok(true));
-            header.unlock_read(42);
+            assert_eq!(header.lock_read(id, DontBlock), Ok(true));
+            header.unlock_read(id);
         }
     }
 
@@ -542,10 +619,10 @@ mod test {
     fn lock_write_succeeds_when_id_matches() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.lock_write(42, DontBlock), Ok(true));
-            header.unlock_write(42);
+            assert_eq!(header.lock_write(id, DontBlock), Ok(true));
+            header.unlock_write(id);
         }
     }
 
@@ -553,9 +630,9 @@ mod test {
     fn lock_read_fails_when_id_doesnt_match() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.lock_read(24, DontBlock), Ok(false));
+            assert_eq!(header.lock_read(id + 1, DontBlock), Ok(false));
         }
     }
 
@@ -563,9 +640,9 @@ mod test {
     fn lock_write_fails_when_id_doesnt_match() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.lock_write(24, DontBlock), Ok(false));
+            assert_eq!(header.lock_write(id + 1, DontBlock), Ok(false));
         }
     }
 
@@ -573,12 +650,12 @@ mod test {
     fn double_read_lock_succeeds() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_read(42, DontBlock).unwrap();
-            assert_eq!(header.lock_read(42, DontBlock), Ok(true));
-            header.unlock_read(42);
-            header.unlock_read(42);
+            header.lock_read(id, DontBlock).unwrap();
+            assert_eq!(header.lock_read(id, DontBlock), Ok(true));
+            header.unlock_read(id);
+            header.unlock_read(id);
         }
     }
 
@@ -586,9 +663,12 @@ mod test {
     fn remove_succeeds_when_id_matches() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.remove(42, DontBlock), Ok(true));
+            assert_eq!(
+                header.remove(id, DontBlock),
+                Ok(RemoveResult::Matched { may_reuse: true })
+            );
         }
     }
 
@@ -596,17 +676,20 @@ mod test {
     fn remove_fails_when_id_doesnt_match() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            assert_eq!(header.remove(24, DontBlock), Ok(false));
+            assert_eq!(
+                header.remove(id + 1, DontBlock),
+                Ok(RemoveResult::DidntMatch)
+            );
         }
     }
 
     #[test]
-    fn remove_fails_before_insertion() {
+    fn remove_fails_before_occupation() {
         unsafe {
             let header = Header::new();
-            assert_eq!(header.remove(42, DontBlock), Ok(false));
+            assert_eq!(header.remove(42, DontBlock), Ok(RemoveResult::DidntMatch));
         }
     }
 
@@ -614,10 +697,10 @@ mod test {
     fn remove_fails_after_double_invocation() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.remove(42, DontBlock).unwrap();
-            assert_eq!(header.remove(42, DontBlock), Ok(false));
+            header.remove(id, DontBlock).unwrap();
+            assert_eq!(header.remove(id, DontBlock), Ok(RemoveResult::DidntMatch));
         }
     }
 
@@ -625,11 +708,11 @@ mod test {
     fn cannot_lock_read_when_locking_write() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_write(42, DontBlock).unwrap();
-            assert_eq!(header.lock_read(42, DontBlock), Err(TimedOut));
-            header.unlock_write(42);
+            header.lock_write(id, DontBlock).unwrap();
+            assert_eq!(header.lock_read(id, DontBlock), Err(TimedOut));
+            header.unlock_write(id);
         }
     }
 
@@ -637,11 +720,11 @@ mod test {
     fn cannot_lock_write_when_locking_read() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_read(42, DontBlock).unwrap();
-            assert_eq!(header.lock_write(42, DontBlock), Err(TimedOut));
-            header.unlock_read(42);
+            header.lock_read(id, DontBlock).unwrap();
+            assert_eq!(header.lock_write(id, DontBlock), Err(TimedOut));
+            header.unlock_read(id);
         }
     }
 
@@ -649,11 +732,11 @@ mod test {
     fn cannot_remove_when_locking_read() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_read(42, DontBlock).unwrap();
-            assert_eq!(header.remove(42, DontBlock), Err(TimedOut));
-            header.unlock_read(42);
+            header.lock_read(id, DontBlock).unwrap();
+            assert_eq!(header.remove(id, DontBlock), Err(TimedOut));
+            header.unlock_read(id);
         }
     }
 
@@ -661,11 +744,11 @@ mod test {
     fn cannot_remove_when_locking_write() {
         unsafe {
             let header = Header::new();
-            header.insert(42);
+            let id = header.occupy();
 
-            header.lock_write(42, DontBlock).unwrap();
-            assert_eq!(header.remove(42, DontBlock), Err(TimedOut));
-            header.unlock_write(42);
+            header.lock_write(id, DontBlock).unwrap();
+            assert_eq!(header.remove(id, DontBlock), Err(TimedOut));
+            header.unlock_write(id);
         }
     }
 }

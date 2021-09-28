@@ -8,12 +8,11 @@ use std::ptr;
 use std::ptr::NonNull;
 
 use crate::header::Header;
-use crate::header::RESERVED_ID;
 use crate::id::Id;
 use crate::rwstore_id::RwStoreId;
 use crate::util::debug_check::{DebugCheckedMaybeUninit, IndexDebugChecked, UnwrapDebugChecked};
-use crate::BlockResult;
 use crate::Timeout;
+use crate::{header, BlockResult};
 
 type Next<Element> = Option<Pin<Box<Block<Element>>>>;
 
@@ -81,7 +80,6 @@ impl<Element> Block<Element> {
     }
 
     pub unsafe fn insert(
-        id: u32,
         bucket_id: u32,
         slot_address: NonNull<()>,
         element: Element,
@@ -93,28 +91,31 @@ impl<Element> Block<Element> {
             .get()
             .write(DebugCheckedMaybeUninit::new(element));
 
-        slot.header.insert(id);
+        let id = slot.header.occupy();
 
         Id::new(id, bucket_id, slot, store_id)
     }
 
-    pub unsafe fn remove(id: Id, timeout: Timeout) -> BlockResult<Option<Element>> {
+    pub unsafe fn remove(id: Id, timeout: Timeout) -> BlockResult<Option<RemoveResult<Element>>> {
         let slot = Self::slot_from_id(id);
 
-        if slot.header.remove(id.ordinal(), timeout)? {
-            let element = slot.value.get().read().assume_init();
-            Ok(Some(element))
-        } else {
-            Ok(None)
+        match slot.header.remove(id.ordinal(), timeout)? {
+            header::RemoveResult::Matched { may_reuse } => {
+                let element = slot.value.get().read().assume_init();
+
+                Ok(Some(RemoveResult { element, may_reuse }))
+            }
+            header::RemoveResult::DidntMatch => Ok(None),
         }
     }
 
-    pub unsafe fn remove_locked(id: Id) -> Element {
+    pub unsafe fn remove_locked(id: Id) -> RemoveResult<Element> {
         let slot = Self::slot_from_id(id);
 
         let element = slot.value.get().read().assume_init();
-        slot.header.remove_locked(id.ordinal());
-        element
+        let may_reuse = slot.header.remove_locked(id.ordinal());
+
+        RemoveResult { element, may_reuse }
     }
 
     pub unsafe fn lock_read(id: Id, timeout: Timeout) -> BlockResult<bool> {
@@ -180,18 +181,14 @@ impl<Element> Block<Element> {
         let slot = self.scramble_slot(slot);
         let slot = self.slots.get_debug_checked_mut(slot as usize);
 
-        let id = slot.header.id();
+        let id = slot.header.id_if_occupied()?;
 
-        if id != RESERVED_ID {
-            let id = Id::new(id, bucket_id, slot, self.header.store_id);
+        let id = Id::new(id, bucket_id, slot, self.header.store_id);
 
-            let element_contents = (&*slot.value.get()).contents_ptr();
-            let element = &mut *element_contents.as_ptr();
+        let element_contents = (&*slot.value.get()).contents_ptr();
+        let element = &mut *element_contents.as_ptr();
 
-            Some((id, element))
-        } else {
-            None
-        }
+        Some((id, element))
     }
 
     pub fn into_next(mut self: Pin<Box<Self>>) -> Option<Pin<Box<Self>>> {
@@ -228,6 +225,12 @@ impl<Element> Block<Element> {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct RemoveResult<Element> {
+    pub element: Element,
+    pub may_reuse: bool,
+}
+
 struct BlockHeader<Element> {
     next: Next<Element>,
     store_id: RwStoreId,
@@ -256,7 +259,7 @@ impl<Element> Slot<Element> {
 }
 impl<Element> Drop for Slot<Element> {
     fn drop(&mut self) {
-        if self.header.is_occupied() {
+        if self.header.needs_drop() {
             unsafe { self.value.get().cast::<Element>().drop_in_place() }
         }
     }
@@ -268,7 +271,7 @@ mod test {
     use std::pin::Pin;
     use std::rc::Rc;
 
-    use crate::block::{Block, Slot};
+    use crate::block::{Block, RemoveResult, Slot};
     use crate::id::Id;
     use crate::rwstore_id::RwStoreId;
     use crate::Timeout::DontBlock;
@@ -285,9 +288,8 @@ mod test {
             let store_id = store_id();
             let block = Block::<u32>::new(1, None, store_id);
             let slot = block.slot_address(0);
-            let id = Block::insert(42, 24, slot, 12, store_id);
+            let id = Block::insert(24, slot, 12, store_id);
 
-            assert_eq!(id.ordinal(), 42);
             assert_eq!(id.bucket_id(), 24);
         }
     }
@@ -311,7 +313,14 @@ mod test {
     fn removal_succeeds_when_id_matches() {
         unsafe {
             let (_block, id) = singleton_block();
-            assert_eq!(Block::<u32>::remove(id, DontBlock), Ok(Some(24)));
+
+            assert_eq!(
+                Block::<u32>::remove(id, DontBlock),
+                Ok(Some(RemoveResult {
+                    element: 24,
+                    may_reuse: true
+                }))
+            );
         }
     }
 
@@ -373,7 +382,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(42, 24, slot, element, store_id);
+            let id = Block::insert(24, slot, element, store_id);
             Block::<Element>::remove(id, DontBlock).unwrap();
 
             assert_eq!(state.get(), 42);
@@ -404,7 +413,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(42, 24, slot, element, store_id);
+            let id = Block::insert(24, slot, element, store_id);
 
             Block::<Element>::lock_write(id, DontBlock).unwrap();
             Block::<Element>::remove_locked(id);
@@ -437,7 +446,7 @@ mod test {
                 state: state.clone(),
             };
 
-            Block::insert(42, 24, slot, element, store_id);
+            Block::insert(24, slot, element, store_id);
         }
 
         assert_eq!(state.get(), 42);
@@ -447,7 +456,7 @@ mod test {
         let store_id = store_id();
         let block = Block::new(1, None, store_id);
         let slot = block.slot_address(0);
-        let id = Block::insert(42, 12, slot, 24, store_id);
+        let id = Block::insert(12, slot, 24, store_id);
         (block, id)
     }
 

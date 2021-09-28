@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 
 use crate::block::Block;
-use crate::id_generator::IdGenerator;
 use crate::rwstore_id::RwStoreId;
 use crate::util::sync::atomic::{AtomicU32, Ordering};
 use crate::util::sync::rwlock::RwLock;
@@ -13,14 +12,12 @@ const RESIZE_FACTOR: u32 = 2;
 
 pub struct Bucket<Element> {
     pub inner: RwLock<BucketInner<Element>>,
-    pub id_generator: IdGenerator,
 }
 
 impl<Element> Bucket<Element> {
     pub fn new(store_id: RwStoreId) -> Self {
         Self {
             inner: RwLock::new(BucketInner::new(store_id)),
-            id_generator: IdGenerator::new(),
         }
     }
 

@@ -58,10 +58,10 @@ impl Id {
 
 impl Debug for Id {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.debug_tuple("Id")
-            .field(&self.ordinal)
-            .field(&self.bucket_id)
-            .field(&self.slot_address)
+        f.debug_struct("Id")
+            .field("id", &self.ordinal)
+            .field("bucket", &self.bucket_id)
+            .field("address", &self.slot_address)
             .finish()
     }
 }

@@ -149,7 +149,7 @@ fn bench_workload<GlobalSetup, ThreadSetup, Operate, Element>(
 
     let results: Vec<_> = (1..=MAX_THREAD_COUNT)
         .map(|threads| {
-            let mut trials: Vec<_> = (0..TRIALS)
+            let trials: Vec<_> = (0..TRIALS)
                 .map(|_| {
                     let elapsed = time_workload(threads, batch_size, &workload);
                     let throughput = batch_size as f64 / elapsed.as_secs_f64();
@@ -157,10 +157,12 @@ fn bench_workload<GlobalSetup, ThreadSetup, Operate, Element>(
                 })
                 .collect();
 
-            trials.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = trials[trials.len() / 2];
+            let mut sum = 0.0;
+            for trail in &trials {
+                sum += trail;
+            }
 
-            median
+            sum / trials.len() as f64
         })
         .collect();
 
