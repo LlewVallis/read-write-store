@@ -155,16 +155,16 @@ impl<Element> RwStore<Element> {
     /// let id = store.insert(42);
     /// ```
     pub fn insert(&self, element: Element) -> Id {
-        let (bucket_id, slot_address) = if let Some(erasure) = self.erasures.pop() {
-            (erasure.bucket_id, erasure.slot_address)
+        let slot_address = if let Some(erasure) = self.erasures.pop() {
+            erasure.slot_address
         } else {
             let bucket_id = self.arbitrary_bucket_id();
             let bucket = &self.buckets[bucket_id as usize];
             let slot_address = bucket.next_insert_location();
-            (bucket_id, slot_address)
+            slot_address
         };
 
-        unsafe { Block::insert(bucket_id, slot_address, element, self.store_id) }
+        unsafe { Block::insert(slot_address, element, self.store_id) }
     }
 
     /// Removes an element from the store using its ID if it has not already been removed. Returns
@@ -262,7 +262,6 @@ impl<Element> RwStore<Element> {
 
     fn push_erasure(&self, id: Id) {
         self.erasures.push(Erasure {
-            bucket_id: id.bucket_id(),
             slot_address: id.slot(),
         });
     }
@@ -552,7 +551,6 @@ impl<Element: UnwindSafe> UnwindSafe for RwStore<Element> {}
 impl<Element: RefUnwindSafe> RefUnwindSafe for RwStore<Element> {}
 
 struct Erasure {
-    bucket_id: u32,
     slot_address: NonNull<()>,
 }
 
@@ -570,10 +568,6 @@ mod test {
         let id_a = store.insert(42);
         let id_b = store.insert(42);
 
-        assert_ne!(
-            (id_a.ordinal(), id_a.bucket_id()),
-            (id_b.ordinal(), id_b.bucket_id())
-        );
         assert_ne!(id_a.slot::<()>(), id_b.slot());
     }
 

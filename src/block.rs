@@ -80,7 +80,6 @@ impl<Element> Block<Element> {
     }
 
     pub unsafe fn insert(
-        bucket_id: u32,
         slot_address: NonNull<()>,
         element: Element,
         store_id: RwStoreId,
@@ -93,7 +92,7 @@ impl<Element> Block<Element> {
 
         let id = slot.header.occupy();
 
-        Id::new(id, bucket_id, slot, store_id)
+        Id::new(id, slot, store_id)
     }
 
     pub unsafe fn remove(id: Id, timeout: Timeout) -> BlockResult<Option<RemoveResult<Element>>> {
@@ -160,12 +159,12 @@ impl<Element> Block<Element> {
         }
     }
 
-    pub unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, Element)> {
+    pub unsafe fn take(&mut self, slot: u32) -> Option<(Id, Element)> {
         let slot = self.scramble_slot(slot);
         let slot = self.slots.get_debug_checked_mut(slot as usize);
 
         if let Some(id) = slot.header.reset() {
-            let id = Id::new(id, bucket_id, slot, self.header.store_id);
+            let id = Id::new(id, slot, self.header.store_id);
             let element = slot.value.get().read().assume_init();
             Some((id, element))
         } else {
@@ -176,14 +175,13 @@ impl<Element> Block<Element> {
     pub unsafe fn slot_contents<'a>(
         &mut self,
         slot: u32,
-        bucket_id: u32,
     ) -> Option<(Id, &'a mut Element)> {
         let slot = self.scramble_slot(slot);
         let slot = self.slots.get_debug_checked_mut(slot as usize);
 
         let id = slot.header.id_if_occupied()?;
 
-        let id = Id::new(id, bucket_id, slot, self.header.store_id);
+        let id = Id::new(id, slot, self.header.store_id);
 
         let element_contents = (&*slot.value.get()).contents_ptr();
         let element = &mut *element_contents.as_ptr();
@@ -283,18 +281,6 @@ mod test {
     }
 
     #[test]
-    fn insert_creates_an_appropriate_id() {
-        unsafe {
-            let store_id = store_id();
-            let block = Block::<u32>::new(1, None, store_id);
-            let slot = block.slot_address(0);
-            let id = Block::insert(24, slot, 12, store_id);
-
-            assert_eq!(id.bucket_id(), 24);
-        }
-    }
-
-    #[test]
     fn removal_fails_on_an_empty_slot() {
         unsafe {
             let store_id = store_id();
@@ -302,7 +288,7 @@ mod test {
 
             let id = {
                 let slot = block.slot_address(0).cast::<Slot<u32>>().as_ref();
-                Id::new(42, 24, slot, store_id)
+                Id::new(42, slot, store_id)
             };
 
             assert_eq!(Block::<u32>::remove(id, DontBlock), Ok(None));
@@ -354,7 +340,7 @@ mod test {
     fn create_mismatching_id(id: Id) -> Id {
         unsafe {
             let slot = id.slot::<Slot<u32>>().as_ref();
-            Id::new(id.ordinal() + 1, id.bucket_id(), slot, id.store_id())
+            Id::new(id.ordinal() + 1, slot, id.store_id())
         }
     }
 
@@ -382,7 +368,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(24, slot, element, store_id);
+            let id = Block::insert(slot, element, store_id);
             Block::<Element>::remove(id, DontBlock).unwrap();
 
             assert_eq!(state.get(), 42);
@@ -413,7 +399,7 @@ mod test {
                 state: state.clone(),
             };
 
-            let id = Block::insert(24, slot, element, store_id);
+            let id = Block::insert(slot, element, store_id);
 
             Block::<Element>::lock_write(id, DontBlock).unwrap();
             Block::<Element>::remove_locked(id);
@@ -446,7 +432,7 @@ mod test {
                 state: state.clone(),
             };
 
-            Block::insert(24, slot, element, store_id);
+            Block::insert(slot, element, store_id);
         }
 
         assert_eq!(state.get(), 42);
@@ -456,7 +442,7 @@ mod test {
         let store_id = store_id();
         let block = Block::new(1, None, store_id);
         let slot = block.slot_address(0);
-        let id = Block::insert(12, slot, 24, store_id);
+        let id = Block::insert(slot, 24, store_id);
         (block, id)
     }
 

@@ -30,14 +30,13 @@ impl<Element> IntoIter<Element> {
     /// Creates an owned iterator over an [RwStore](crate::RwStore).
     pub fn new(store: RwStore<Element>) -> Self {
         let bucket_iters = IntoIterator::into_iter(store.buckets)
-            .enumerate()
-            .map(|(bucket_id, bucket)| {
+            .map(|bucket| {
                 let block_list = bucket.into_inner().inner.into_inner();
 
                 let last_slot = block_list.next_unused_slot.into_inner();
                 let current_block = block_list.head.map(OwnedBlockTracker::new);
 
-                GenBucketIter::new(bucket_id as u32, last_slot, current_block)
+                GenBucketIter::new(last_slot, current_block)
             })
             .collect();
 
@@ -91,14 +90,13 @@ impl<'a, Element> IterMut<'a, Element> {
         let bucket_iters = store
             .buckets
             .iter_mut()
-            .enumerate()
-            .map(|(bucket_id, bucket)| {
+            .map(|bucket| {
                 let block_list = bucket.inner.get_mut();
 
                 let last_slot = block_list.next_unused_slot.load_directly();
                 let current_block = block_list.head.as_mut().map(MutBlockTracker::new);
 
-                GenBucketIter::new(bucket_id as u32, last_slot, current_block)
+                GenBucketIter::new(last_slot, current_block)
             })
             .collect();
 
@@ -171,18 +169,16 @@ impl<Tracker: BlockTracker> Iterator for GenIter<Tracker> {
 impl<Tracker: BlockTracker> FusedIterator for GenIter<Tracker> {}
 
 struct GenBucketIter<Tracker: BlockTracker> {
-    bucket_id: u32,
     last_slot: u32,
     current_block: Option<Tracker>,
 }
 
 impl<Tracker: BlockTracker> GenBucketIter<Tracker> {
-    pub fn new(bucket_id: u32, last_slot: u32, current_block: Option<Tracker>) -> Self {
+    pub fn new(last_slot: u32, current_block: Option<Tracker>) -> Self {
         let max_last_slot = current_block.as_ref().map(|block| block.len()).unwrap_or(0);
         let last_slot = last_slot.min(max_last_slot);
 
         Self {
-            bucket_id,
             last_slot,
             current_block,
         }
@@ -209,7 +205,7 @@ impl<Tracker: BlockTracker> Iterator for GenBucketIter<Tracker> {
             let current_block = self.current_block.as_mut().unwrap_debug_checked();
             self.last_slot -= 1;
 
-            let contents = current_block.take(self.last_slot, self.bucket_id);
+            let contents = current_block.take(self.last_slot);
             match contents {
                 Some(result) => Some(result),
                 None => self.next(),
@@ -238,7 +234,7 @@ trait BlockTracker: Sized {
 
     fn next(self) -> Option<Self>;
 
-    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<Self::Element>;
+    unsafe fn take(&mut self, slot: u32) -> Option<Self::Element>;
 
     fn len(&self) -> u32;
 }
@@ -260,11 +256,11 @@ impl<Element> BlockTracker for OwnedBlockTracker<Element> {
         Block::into_next(self.block).map(OwnedBlockTracker::new)
     }
 
-    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, Element)> {
+    unsafe fn take(&mut self, slot: u32) -> Option<(Id, Element)> {
         self.block
             .as_mut()
             .get_unchecked_mut()
-            .take(slot, bucket_id)
+            .take(slot)
     }
 
     fn len(&self) -> u32 {
@@ -295,11 +291,11 @@ impl<'a, Element> BlockTracker for MutBlockTracker<'a, Element> {
         }
     }
 
-    unsafe fn take(&mut self, slot: u32, bucket_id: u32) -> Option<(Id, &'a mut Element)> {
+    unsafe fn take(&mut self, slot: u32) -> Option<(Id, &'a mut Element)> {
         self.block
             .as_mut()
             .get_unchecked_mut()
-            .slot_contents(slot, bucket_id)
+            .slot_contents(slot)
     }
 
     fn len(&self) -> u32 {

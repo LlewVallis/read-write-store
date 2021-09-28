@@ -24,16 +24,14 @@ use crate::rwstore_id::RwStoreId;
 #[derive(Copy, Clone)]
 pub struct Id {
     ordinal: u32,
-    bucket_id: u32,
     slot_address: NonNull<()>,
     store_id: RwStoreId,
 }
 
 impl Id {
-    pub(crate) fn new<T>(ordinal: u32, bucket_id: u32, slot: &T, store_id: RwStoreId) -> Self {
+    pub(crate) fn new<T>(ordinal: u32, slot: &T, store_id: RwStoreId) -> Self {
         Self {
             ordinal,
-            bucket_id,
             slot_address: NonNull::from(slot).cast(),
             store_id,
         }
@@ -41,10 +39,6 @@ impl Id {
 
     pub(crate) fn ordinal(&self) -> u32 {
         self.ordinal
-    }
-
-    pub(crate) fn bucket_id(&self) -> u32 {
-        self.bucket_id
     }
 
     pub(crate) fn slot<T>(&self) -> NonNull<T> {
@@ -60,7 +54,6 @@ impl Debug for Id {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("Id")
             .field("id", &self.ordinal)
-            .field("bucket", &self.bucket_id)
             .field("address", &self.slot_address)
             .finish()
     }
