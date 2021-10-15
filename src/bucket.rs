@@ -53,7 +53,7 @@ impl<Element> Bucket<Element> {
             .map(|block| block.len())
             .unwrap_or(0);
 
-        let used = block_list.next_unused_slot.load(Ordering::Acquire);
+        let used = block_list.next_unused_slot.load(Ordering::Relaxed);
 
         mem::drop(block_list);
 
@@ -82,7 +82,7 @@ impl<Element> BucketInner<Element> {
 
     pub fn next_insert_location(&self) -> Option<NonNull<()>> {
         if let Some(head) = &self.head {
-            let slot = self.next_unused_slot.fetch_add(1, Ordering::AcqRel);
+            let slot = self.next_unused_slot.fetch_add(1, Ordering::Relaxed);
 
             if slot < head.len() {
                 unsafe { Some(head.slot_address(slot)) }

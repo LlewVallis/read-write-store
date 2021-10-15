@@ -50,7 +50,7 @@ impl Header {
     pub unsafe fn lock_read(&self, id: u32, timeout: Timeout) -> BlockResult<bool> {
         debug_assert!(id != RESERVED_ID, "attempted to read lock the reserved ID");
 
-        let current = self.state.load(Ordering::Acquire);
+        let current = self.state.load(Ordering::Relaxed);
         self.lock_read_with_current(id, current, timeout)
     }
 
@@ -88,7 +88,7 @@ impl Header {
         };
 
         let result = self.block(timeout_optional, || {
-            let current = self.state.load(Ordering::Acquire);
+            let current = self.state.load(Ordering::Relaxed);
 
             if Self::id_from_bits(current) != id {
                 return BlockChoice::DontBlock(Response::Mismatch);
@@ -116,7 +116,7 @@ impl Header {
     /// Read unlocks the header. The header must be currently read locked and the ID must match the
     /// header's current ID.
     pub unsafe fn unlock_read(&self, id: u32) {
-        let current = self.state.load(Ordering::Acquire);
+        let current = self.state.load(Ordering::Relaxed);
         self.unlock_read_with_current(id, current)
     }
 
@@ -395,12 +395,12 @@ impl Header {
 
     fn compare_exchange(&self, expected: u64, new: u64) -> Result<u64, u64> {
         self.state
-            .compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(expected, new, Ordering::Release, Ordering::Relaxed)
     }
 
     fn compare_exchange_weak(&self, expected: u64, new: u64) -> Result<u64, u64> {
         self.state
-            .compare_exchange_weak(expected, new, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_weak(expected, new, Ordering::Release, Ordering::Relaxed)
     }
 
     fn unoccupied_bits(id: u32) -> u64 {
